@@ -72,9 +72,12 @@ def _to_openai_role(
   return "user"
 
 
+_serialize_system_instruction = _openai_common.serialize_system_instruction
+_tool_choice = _openai_common.tool_choice
 # The finish-reason mapper lives in _openai_common; alias it under the private
 # name this module and its tests use.
 _map_finish_reason = _openai_common.map_finish_reason
+_is_reasoning_model = _openai_common.is_reasoning_model
 
 
 def _part_to_openai_content(
@@ -239,6 +242,13 @@ def _extract_cached_token_count(usage: CompletionUsage) -> int | None:
   return cached if isinstance(cached, int) else None
 
 
+def _extract_reasoning_token_count(usage: CompletionUsage) -> int | None:
+  """Returns OpenAI completion_tokens_details.reasoning_tokens, if present."""
+  details = getattr(usage, "completion_tokens_details", None)
+  reasoning = getattr(details, "reasoning_tokens", None)
+  return reasoning if isinstance(reasoning, int) else None
+
+
 def _usage_metadata(
     usage: CompletionUsage | None,
 ) -> types.GenerateContentResponseUsageMetadata | None:
@@ -250,6 +260,14 @@ def _usage_metadata(
       candidates_token_count=usage.completion_tokens,
       total_token_count=usage.total_tokens,
       cached_content_token_count=_extract_cached_token_count(usage),
+      # Reasoning tokens are also counted in completion_tokens, matching the
+      # Responses surface's candidates/thoughts mapping. Unlike Gemini, where
+      # the two buckets are disjoint, thoughts here is a subset of candidates,
+      # so telemetry/_token_usage.py (which sums candidates + thoughts into
+      # output tokens) over-counts reasoning tokens for OpenAI models. That
+      # aggregator needs to learn about overlapping buckets; until then this
+      # keeps both OpenAI surfaces consistent.
+      thoughts_token_count=_extract_reasoning_token_count(usage),
   )
 
 
@@ -331,7 +349,12 @@ class OpenAILlm(BaseLlm):
 
   Attributes:
       model: The name of the OpenAI model.
-      max_tokens: The maximum number of tokens to generate.
+      max_tokens: The maximum number of tokens to generate. For reasoning models
+        this is sent as ``max_completion_tokens``, which also covers hidden
+        reasoning tokens; a budget too small for the reasoning phase yields an
+        empty response with ``finish_reason`` ``length`` (surfaced as a
+        MAX_TOKENS error, not silently), so raise this for reasoning models that
+        need visible output.
       api_key: The API key, either as a string or as a zero-argument callable
         returning a string (or an awaitable of one). ``AsyncOpenAI`` re-invokes
         a callable on every request, so it can supply a credential that expires
@@ -360,28 +383,34 @@ class OpenAILlm(BaseLlm):
   async def generate_content_async(
       self, llm_request: LlmRequest, stream: bool = False
   ) -> AsyncGenerator[LlmResponse, None]:
-    messages = []
+    messages: list[Any] = []
     if llm_request.config and llm_request.config.system_instruction:
-      messages.append({
-          "role": "system",
-          "content": llm_request.config.system_instruction,
-      })
+      system_text = _serialize_system_instruction(
+          llm_request.config.system_instruction
+      )
+      if system_text:
+        messages.append({"role": "system", "content": system_text})
 
     for content in llm_request.contents or []:
       messages.extend(_content_to_openai_messages(content))
 
     tools = []
-    if (
-        llm_request.config
-        and llm_request.config.tools
-        and llm_request.config.tools[0].function_declarations
-    ):
-      tools = [
-          _function_declaration_to_openai_tool(tool)
-          for tool in llm_request.config.tools[0].function_declarations
-      ]
+    if llm_request.config and llm_request.config.tools:
+      for tool in llm_request.config.tools:
+        if not tool.function_declarations:
+          logger.warning(
+              "Skipping a tool with no function declarations; only function"
+              " tools are supported on the Chat Completions API."
+          )
+          continue
+        for function_declaration in tool.function_declarations:
+          tools.append(
+              _function_declaration_to_openai_tool(function_declaration)
+          )
 
-    tool_choice = "auto" if tools else None
+    tool_choice = None
+    if tools:
+      tool_choice = _tool_choice(llm_request.config) or "auto"
 
     response_format = None
     if llm_request.config and llm_request.config.response_schema:
@@ -416,7 +445,7 @@ class OpenAILlm(BaseLlm):
     ):
       response_format = {"type": "json_object"}
 
-    kwargs = {
+    kwargs: dict[str, Any] = {
         "model": self.model,
         "messages": messages,
         "tools": tools if tools else None,
@@ -435,6 +464,37 @@ class OpenAILlm(BaseLlm):
       if getattr(llm_request.config, "max_output_tokens", None) is not None:
         kwargs["max_tokens"] = llm_request.config.max_output_tokens
 
+    # Reasoning models (o-series, gpt-5.x, gpt-6.x) reject ``max_tokens`` (they
+    # require ``max_completion_tokens``) and reject a non-default
+    # ``temperature`` / ``top_p``. Normalize the assembled kwargs once so both
+    # the ``self.max_tokens`` and ``config.max_output_tokens`` write sites, and
+    # the streaming and non-streaming paths, are covered.
+    if _is_reasoning_model(self.model):
+      # ``max_tokens`` is always present (self.max_tokens is a non-optional int
+      # and any config override is also non-None), so move it unconditionally.
+      kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+    # Reasoning models reject a non-default temperature/top_p; strip either from
+    # the request (with a warning) when it would 400.
+    _openai_common.strip_unsupported_sampling_params(kwargs, self.model)
+
+    # Reasoning effort (from OpenAIGenerateContentConfig.effort) maps to the
+    # flat ``reasoning_effort`` Chat Completions parameter. The tier is
+    # validated against the model only when the request targets the real
+    # OpenAI backend (see ``targets_default_openai_host``); otherwise it is
+    # passed through for the compatible backend to accept or reject.
+    validate = _openai_common.targets_default_openai_host(
+        client=self.client,
+        base_url=self.base_url,
+    )
+    effort = _openai_common.build_reasoning_effort(
+        llm_request.config,
+        self.model,
+        "chat",
+        validate=validate,
+    )
+    if effort is not None:
+      kwargs["reasoning_effort"] = effort
+
     if not stream:
       response = await self._openai_client.chat.completions.create(**kwargs)
       yield _response_to_llm_response(response)
@@ -448,15 +508,24 @@ class OpenAILlm(BaseLlm):
   ) -> AsyncGenerator[LlmResponse, None]:
     """Handles streaming responses from OpenAI models."""
     kwargs["stream"] = True
+    # Ask for the trailing usage-only chunk. Backends that ignore this simply
+    # never send it, so the metadata stays absent rather than the call failing.
+    kwargs["stream_options"] = {"include_usage": True}
     raw_stream = await self._openai_client.chat.completions.create(**kwargs)
 
     text_accumulated = ""
     tool_calls_accumulated: dict[int, dict[str, Any]] = {}
+    usage: CompletionUsage | None = None
+    finish_reason: str | None = None
 
     async for chunk in raw_stream:
+      if getattr(chunk, "usage", None):
+        usage = chunk.usage
       if not chunk.choices:
         continue
       choice = chunk.choices[0]
+      if getattr(choice, "finish_reason", None):
+        finish_reason = choice.finish_reason
       delta = choice.delta
 
       if delta.content:
@@ -533,9 +602,37 @@ class OpenAILlm(BaseLlm):
       part.function_call.id = acc["id"]
       parts.append(part)
 
+    mapped_finish_reason = _map_finish_reason(finish_reason)
+
+    if not parts and mapped_finish_reason not in (
+        None,
+        types.FinishReason.STOP,
+    ):
+      # Nothing was streamed and the model stopped for an abnormal reason (e.g.
+      # content filtering, or hitting the token limit before emitting anything).
+      # Mirror the non-streaming path and surface it as an error rather than a
+      # silent empty final chunk.
+      yield LlmResponse(
+          error_code=mapped_finish_reason,
+          error_message=(
+              "OpenAI streaming response finished with reason"
+              f" {finish_reason!r} and no content."
+          ),
+          finish_reason=mapped_finish_reason,
+          usage_metadata=_usage_metadata(usage),
+      )
+      return
+
+    # Final chunk. Unlike the non-streaming path (which returns content=None for
+    # an empty body), the streaming path always emits a non-partial closing
+    # response so the trailing usage-only chunk still delivers usage_metadata to
+    # the caller; a None content here would be dropped downstream and the token
+    # usage lost. An empty parts list is therefore expected and intentional.
     yield LlmResponse(
         content=types.Content(role="model", parts=parts),
         partial=False,
+        usage_metadata=_usage_metadata(usage),
+        finish_reason=mapped_finish_reason,
     )
 
   @cached_property
